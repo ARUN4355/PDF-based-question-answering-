@@ -1,140 +1,111 @@
 import os
 from flask import Flask, request, jsonify
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt
 from werkzeug.utils import secure_filename
+
+from flask_jwt_extended import (
+    JWTManager, create_access_token,
+    jwt_required, get_jwt_identity
+)
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
 
-import easyocr
-from pdf2image import convert_from_path
-from pdf2image.exceptions import PDFInfoNotInstalledError
-from transformers import pipeline
-
+# ---------------- BASIC CONFIG ----------------
 UPLOAD_FOLDER = "uploads"
-DB_FOLDER = "faiss_db"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(DB_FOLDER, exist_ok=True)
 
+USERS = {"admin": "admin@9"}
+USER_INDEX = {}
+
+# ---------------- FLASK APP ----------------
 app = Flask(__name__)
-app.config["JWT_SECRET_KEY"] = "secret123"
+app.config["JWT_SECRET_KEY"] = "nalco-secret"
 jwt = JWTManager(app)
-# JWT blacklist
-blacklisted_tokens = set()
-@jwt.token_in_blocklist_loader
-def check_if_token_revoked(jwt_header, jwt_payload):
-    jti = jwt_payload["jti"]
-    return jti in blacklisted_tokens
+
+# ---------------- EMBEDDINGS (FAST, CPU-SAFE) ----------------
+embeddings = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
+
+# ---------------- TEXT EXTRACTION ----------------
+def extract_text(pdf_path):
+    loader = PyPDFLoader(pdf_path)
+    pages = loader.load()
+
+    valid_pages = []
+    total_chars = 0
+
+    for p in pages:
+        text = p.page_content.strip()
+        if len(text) > 100:
+            valid_pages.append(p)
+            total_chars += len(text)
+
+    if not valid_pages or total_chars < 1000:
+        return []
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800,
+        chunk_overlap=100
+    )
+
+    return splitter.split_documents(valid_pages)
 
 # ---------------- AUTH ----------------
 @app.route("/login", methods=["POST"])
 def login():
     data = request.json
-    if data["username"] == "admin" and data["password"] == "admin@9":
-        return jsonify(access_token=create_access_token(identity="admin"))
-    return jsonify(msg="Bad credentials"), 401
-
-
-# ---------------- OCR ----------------
-reader = easyocr.Reader(['en'])
-
-def ocr_pdf(pdf_path):
-    try:
-        images = convert_from_path(pdf_path)
-    except PDFInfoNotInstalledError:
-        raise RuntimeError(
-            "This PDF is scanned and requires Poppler. "
-            "Please install Poppler from https://github.com/oschwartz10612/poppler-windows"
-        )
-
-    text = ""
-    for img in images:
-        result = reader.readtext(img)
-        for (_, t, _) in result:
-            text += t + " "
-    return text 
-
-
-# ---------------- PDF TEXT ----------------
-def extract_text(pdf_path):
-    loader = PyPDFLoader(pdf_path)
-    pages = loader.load()
-    full_text = " ".join([p.page_content for p in pages])
-
-    if sum(c.isalnum() for c in full_text) < 50:
-        print("Using OCR...")
-        full_text = ocr_pdf(pdf_path)
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    return splitter.create_documents([full_text])
-
-
-# ---------------- VECTOR DB ----------------
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
-
-def build_db(docs):
-    db = FAISS.from_documents(docs, embeddings)
-    db.save_local(DB_FOLDER)
-
-def load_db():
-    return FAISS.load_local(DB_FOLDER, embeddings, allow_dangerous_deserialization=True)
-
-
-# ---------------- OFFLINE LLM ----------------
-llm = pipeline("text2text-generation", model="google/flan-t5-small")
-
-def ask_llm(context, query):
-    prompt = f"Context: {context}\n\nQuestion: {query}\nAnswer:"
-    return llm(prompt, max_new_tokens=200)[0]["generated_text"]
-
+    if USERS.get(data.get("username")) == data.get("password"):
+        token = create_access_token(identity=data["username"])
+        return jsonify(access_token=token)
+    return jsonify({"message": "Invalid credentials"}), 401
 
 # ---------------- FILE UPLOAD ----------------
 @app.route("/fileupload", methods=["POST"])
 @jwt_required()
-def upload():
-    file = request.files["file"]
+def upload_pdf():
+    user = get_jwt_identity()
+
+    file = request.files.get("file")
+    if not file or not file.filename.lower().endswith(".pdf"):
+        return jsonify({"message": "Valid PDF required"}), 400
+
     path = os.path.join(UPLOAD_FOLDER, secure_filename(file.filename))
     file.save(path)
 
-    try:
-        docs = extract_text(path)
-    except RuntimeError as e:
-        return jsonify({"error": str(e)}), 400
+    docs = extract_text(path)
+    if not docs:
+        return jsonify({
+            "message": "Scanned or image-based PDF detected. Text PDFs only."
+        }), 400
 
-    build_db(docs)
-
-    return jsonify({"message": "PDF processed successfully"})
-
+    USER_INDEX[user] = FAISS.from_documents(docs, embeddings)
+    return jsonify({"message": "PDF indexed successfully"})
 
 # ---------------- QUERY ----------------
 @app.route("/query", methods=["POST"])
 @jwt_required()
-def query():
-    q = request.json["query"]
-    db = load_db()
-    docs = db.similarity_search(q, k=4)
+def query_pdf():
+    user = get_jwt_identity()
+    query = request.json.get("query", "").strip()
 
-    context = "\n".join([d.page_content for d in docs])
-    answer = ask_llm(context, q)
+    if user not in USER_INDEX:
+        return jsonify({"message": "Upload a PDF first"}), 400
 
-    return jsonify({"answer": answer})
+    retriever = USER_INDEX[user].as_retriever(search_kwargs={"k": 3})
+    docs = retriever.invoke(query)
 
+    if not docs:
+        return jsonify({"answer": "No relevant information found"})
 
-# -----------------LOGOUT------------------ 
-@app.route("/logout", methods=["POST"])
-@jwt_required()
-def logout():
-    jti = get_jwt()["jti"]
-    blacklisted_tokens.add(jti)
-    return jsonify({"message": "Logged out successfully"})
+    # Return best matching paragraph
+    return jsonify({
+        "answer": docs[0].page_content.strip()
+    })
 
-
+# ---------------- RUN ----------------
 if __name__ == "__main__":
-    app.run()
-
-#{"username": "admin", "password": "admin@9"}
-
+    print("🚀 Fast PDF Search API running at http://127.0.0.1:5000")
+    app.run(host="0.0.0.0", port=5000, debug=False)
